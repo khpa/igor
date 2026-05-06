@@ -1,5 +1,10 @@
 #include <Wire.h>
 #include <EEPROM.h>
+#include <cstring>
+#include <ESP8266WiFi.h>
+#include <ESP8266WebServer.h>
+#include <DNSServer.h>
+#include <time.h>
 #include <Adafruit_SSD1306.h>
 
 #ifndef SSD1306_SETCONTRAST
@@ -17,7 +22,7 @@ Adafruit_SSD1306 display(128, 64, &Wire, D4);
 
 // EEPROM layout: 0 magic, 1 sound, 2 defaultDn, 3 idleIdx, 4 offIdx,
 // 5 successStyle, 6 invert, 7 contrast, 8-9 session u16 LE, 10-11 goal u16 LE
-#define EEPROM_SIZE 32
+#define EEPROM_SIZE 512
 #define EE_ADDR_MAGIC 0
 #define EE_ADDR_SOUND 1
 #define EE_ADDR_DEFAULT_DN 2
@@ -36,17 +41,40 @@ Adafruit_SSD1306 display(128, 64, &Wire, D4);
 #define EE_ADDR_MILESTONE 15
 #define EE_ADDR_LAST_MODE 16
 #define EE_ADDR_LAST_DOWN 17
+#define EE_ADDR_DEVICE_MODE 18
+#define EE_ADDR_TZ_OFF_LO 19
+#define EE_ADDR_TZ_OFF_HI 20
+#define EE_ADDR_WIFI_CONFIGURED 21
+#define EE_ADDR_WIFI_SSID 22
+#define EE_WIFI_SSID_MAX 32
+#define EE_ADDR_WIFI_PASS (EE_ADDR_WIFI_SSID + EE_WIFI_SSID_MAX)
+#define EE_WIFI_PASS_MAX 64
 #define EE_LAYOUT_V3 3
+#define EE_LAYOUT_V4 4
 #define EE_MAGIC 0xA5
+
+#define WIFI_AP_SSID "Igor-Setup"
+#define WIFI_PORTAL_TIMEOUT_MS (600000UL)
+
+static const char PORTAL_HTML[] PROGMEM =
+    "<!DOCTYPE html><html><body>"
+    "<h3>WiFi</h3>"
+    "<form method='POST' action='/save'>"
+    "SSID<br><input name='ssid' maxlength='32'><br>"
+    "Password<br><input name='pass' maxlength='64'><br>"
+    "<input type='submit' value='Save'></form>"
+    "</body></html>";
 
 static const uint16_t IDLE_MIN_CHOICE[] = {1, 3, 5, 10};
 static const uint16_t DISPLAY_OFF_MIN_CHOICE[] = {15, 30, 60};
 
 //-----------------------------------------------
 int flowMinutes = 0;   // Total focus minutes
-int menuIndex = 0;     // 0 UP, 1 DOWN, 2 Reset, 3 Sound, 4 Set, 5 Quick, 6 Help
-const int menuOptionCount = 7;
-String menuOptions[menuOptionCount] = {"UP", "DOWN", "Reset", "Sound", "Set", "Quick", "Help"};
+int menuIndex = 0;
+const int menuOptionCount = 8;
+String menuOptions[menuOptionCount] = {"UP", "DOWN", "Reset", "Sound", "Set", "Quick", "Help", "Mode"};
+const int clockMenuCount = 3;
+const char *clockMenuLabels[clockMenuCount] = {"Set", "Help", "Mode"};
 bool soundEnabled = true;
 uint8_t defaultCountdownMinutes = 20;
 uint8_t idleChoiceIndex = 1;       // default 3 min -> IDLE_MIN_CHOICE[1]
@@ -68,8 +96,45 @@ unsigned long lastActivityTime = 0;
 unsigned long inactivityLimitMs = 3UL * 60000UL;
 unsigned long displayOffTimeLimitMs = 30UL * 60000UL;
 
-enum State { MENU, COUNTING_UP, COUNTING_DOWN, SELECTING_DOWN_DURATION, IDLE, SETTINGS, SOUND_MENU, RESET_CONFIRM, POWER_OFF_CONFIRM, HELP };
+enum State {
+  MENU,
+  COUNTING_UP,
+  COUNTING_DOWN,
+  SELECTING_DOWN_DURATION,
+  IDLE,
+  SETTINGS,
+  SOUND_MENU,
+  RESET_CONFIRM,
+  POWER_OFF_CONFIRM,
+  MODE_MENU,
+  WIFI_PORTAL,
+  CLOCK_FACE,
+  HELP
+};
 State currentState = MENU;
+
+enum DeviceMode : uint8_t { DEVICE_FOCUS = 0, DEVICE_CLOCK = 1 };
+DeviceMode deviceMode = DEVICE_FOCUS;
+uint8_t modeMenuValue = 0;
+
+int16_t tzOffsetMinutes = 0;
+bool wifiStaConfigured = false;
+char wifiStaSsid[EE_WIFI_SSID_MAX + 1];
+char wifiStaPass[EE_WIFI_PASS_MAX + 1];
+
+ESP8266WebServer portalServer(80);
+DNSServer dnsServer;
+bool wifiPortalActive = false;
+bool wifiPortalReturnSettings = false;
+unsigned long wifiPortalStartedMs = 0;
+volatile bool portalSaveShutdownPending = false;
+
+unsigned long lastWifiReconnectMs = 0;
+const unsigned long WIFI_RECONNECT_INTERVAL_MS = 10000UL;
+bool wifiNtpAppliedWhileStaUp = false;
+int clockFaceLastTmSec = -1;
+
+void saveAllSettings(void);
 
 enum SetupPage {
   SET_PAGE_DEF,
@@ -83,6 +148,8 @@ enum SetupPage {
   SET_PAGE_POMO,
   SET_PAGE_BRK,
   SET_PAGE_MILE,
+  SET_PAGE_TZ,
+  SET_PAGE_WIFI,
   SET_PAGE_EXIT,
   SET_PAGE_COUNT
 };
@@ -144,15 +211,36 @@ const char *helpLines[] = {
   "RESET: confirm",
   "IDLE: post-session",
   "Idle time -> hint",
-  "HOLD switch: off?"
+  "HOLD switch: off?",
+  "WiFi: join Igor-Setup",
+  "Browser: 192.168.4.1"
 };
 const int helpLineCount = sizeof(helpLines) / sizeof(helpLines[0]);
 
 //=========================================================
-void setup() {  
+void handlePortalRoot();
+void handlePortalSave();
+
+void setup() {
+  wifiStaSsid[0] = '\0';
+  wifiStaPass[0] = '\0';
+
   initHardware();
   loadAllSettings();
   initDisplay();
+
+  if (wifiStaConfigured && wifiStaSsid[0] != '\0') {
+    WiFi.persistent(false);
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(wifiStaSsid, wifiStaPass);
+    lastWifiReconnectMs = millis();
+  }
+
+  if (deviceMode == DEVICE_CLOCK) {
+    currentState = CLOCK_FACE;
+    clockFaceLastTmSec = -1;
+  }
+
   updateDisplay();
   Serial.println("Setup complete, starting loop...");
 }
@@ -160,6 +248,8 @@ void setup() {
 //=========================================================
 void loop() {
   unsigned long currentMillis = millis();
+
+  serviceWiFiAndPortal(currentMillis);
 
   pollEncoderSwitch(currentMillis);
 
@@ -187,6 +277,8 @@ void loop() {
 
   // Handle inactivity
   handleInactivity(currentMillis);
+
+  tickClockFace(currentMillis);
 }
 
 //=========================================================
@@ -199,6 +291,144 @@ void initHardware() {
   digitalWrite(BUZZER_PIN, LOW);
   switchReadingLow = (digitalRead(SW) == LOW);
   Serial.begin(9600);
+}
+
+//=========================================================
+void applyNtpFromSettings() {
+  long offSec = (long)tzOffsetMinutes * 60L;
+  configTime(offSec, 0, "pool.ntp.org", "time.nist.gov");
+}
+
+void stopWifiPortalCore() {
+  portalServer.stop();
+  dnsServer.stop();
+  WiFi.softAPdisconnect(true);
+  wifiPortalActive = false;
+}
+
+void resumeStaIfConfigured() {
+  if (!wifiStaConfigured || wifiStaSsid[0] == '\0') {
+    WiFi.mode(WIFI_OFF);
+    return;
+  }
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(wifiStaSsid, wifiStaPass);
+  lastWifiReconnectMs = millis();
+}
+
+void startWifiPortal() {
+  wifiNtpAppliedWhileStaUp = false;
+  WiFi.disconnect(true);
+  delay(50);
+  WiFi.mode(WIFI_AP);
+  IPAddress apIp(192, 168, 4, 1);
+  WiFi.softAPConfig(apIp, apIp, IPAddress(255, 255, 255, 0));
+  WiFi.softAP(WIFI_AP_SSID);
+  dnsServer.start(53, "*", apIp);
+  portalServer.on("/", HTTP_GET, handlePortalRoot);
+  portalServer.on("/save", HTTP_POST, handlePortalSave);
+  portalServer.begin();
+  wifiPortalActive = true;
+  wifiPortalStartedMs = millis();
+}
+
+void handlePortalRoot() { portalServer.send_P(200, "text/html", PORTAL_HTML); }
+
+void handlePortalSave() {
+  if (!portalServer.hasArg("ssid")) {
+    portalServer.send(400, "text/plain", "missing ssid");
+    return;
+  }
+  String ssid = portalServer.arg("ssid");
+  String pass = portalServer.arg("pass");
+  ssid.trim();
+  pass.trim();
+  if (ssid.length() == 0) {
+    portalServer.send(400, "text/plain", "empty ssid");
+    return;
+  }
+  memset(wifiStaSsid, 0, sizeof(wifiStaSsid));
+  memset(wifiStaPass, 0, sizeof(wifiStaPass));
+  strncpy(wifiStaSsid, ssid.c_str(), EE_WIFI_SSID_MAX);
+  strncpy(wifiStaPass, pass.c_str(), EE_WIFI_PASS_MAX);
+  wifiStaSsid[EE_WIFI_SSID_MAX] = '\0';
+  wifiStaPass[EE_WIFI_PASS_MAX] = '\0';
+  wifiStaConfigured = true;
+  saveAllSettings();
+  portalSaveShutdownPending = true;
+  portalServer.send(200, "text/html", "<p>Saved.</p>");
+}
+
+void serviceWiFiAndPortal(unsigned long ms) {
+  if (wifiPortalActive) {
+    dnsServer.processNextRequest();
+    portalServer.handleClient();
+
+    if (portalSaveShutdownPending) {
+      portalSaveShutdownPending = false;
+      stopWifiPortalCore();
+      resumeStaIfConfigured();
+      if (wifiPortalReturnSettings) {
+        wifiPortalReturnSettings = false;
+        currentState = SETTINGS;
+      } else {
+        currentState = MENU;
+      }
+      updateDisplay();
+      return;
+    }
+
+    if (ms - wifiPortalStartedMs > WIFI_PORTAL_TIMEOUT_MS) {
+      stopWifiPortalCore();
+      resumeStaIfConfigured();
+      if (wifiPortalReturnSettings) {
+        wifiPortalReturnSettings = false;
+        currentState = SETTINGS;
+      } else {
+        currentState = MENU;
+      }
+      updateDisplay();
+    }
+    return;
+  }
+
+  if (!wifiStaConfigured || wifiStaSsid[0] == '\0') return;
+
+  if (WiFi.status() == WL_CONNECTED) {
+    if (!wifiNtpAppliedWhileStaUp) {
+      wifiNtpAppliedWhileStaUp = true;
+      applyNtpFromSettings();
+    }
+    return;
+  }
+
+  wifiNtpAppliedWhileStaUp = false;
+  clockFaceLastTmSec = -1;
+
+  if (ms - lastWifiReconnectMs > WIFI_RECONNECT_INTERVAL_MS) {
+    lastWifiReconnectMs = ms;
+    WiFi.disconnect();
+    WiFi.begin(wifiStaSsid, wifiStaPass);
+  }
+}
+
+void tickClockFace(unsigned long ms) {
+  (void)ms;
+  if (currentState != CLOCK_FACE || displayOff) return;
+  time_t t = time(nullptr);
+  if (t < 1000000000) {
+    if (clockFaceLastTmSec != -2) {
+      clockFaceLastTmSec = -2;
+      updateDisplay();
+    }
+    return;
+  }
+  struct tm ti;
+  localtime_r(&t, &ti);
+  if (ti.tm_sec != clockFaceLastTmSec) {
+    clockFaceLastTmSec = ti.tm_sec;
+    updateDisplay();
+  }
 }
 
 //=========================================================
@@ -220,7 +450,9 @@ void loadAllSettings() {
     soundEnabled = true;
   }
 
-  if (magic == EE_MAGIC && EEPROM.read(EE_ADDR_LAYOUT) == EE_LAYOUT_V3) {
+  byte layout = (magic == EE_MAGIC) ? EEPROM.read(EE_ADDR_LAYOUT) : 0;
+
+  if (magic == EE_MAGIC && (layout == EE_LAYOUT_V3 || layout == EE_LAYOUT_V4)) {
     defaultCountdownMinutes = EEPROM.read(EE_ADDR_DEFAULT_DN);
     idleChoiceIndex = EEPROM.read(EE_ADDR_IDLE_IDX);
     displayOffChoiceIndex = EEPROM.read(EE_ADDR_OFF_IDX);
@@ -250,6 +482,28 @@ void loadAllSettings() {
     milestoneInterval = 0;
     lastMode = 1;
     lastDownDuration = 20;
+  }
+
+  deviceMode = DEVICE_FOCUS;
+  tzOffsetMinutes = 0;
+  wifiStaConfigured = false;
+  wifiStaSsid[0] = '\0';
+  wifiStaPass[0] = '\0';
+
+  if (magic == EE_MAGIC && layout == EE_LAYOUT_V4) {
+    deviceMode = EEPROM.read(EE_ADDR_DEVICE_MODE) ? DEVICE_CLOCK : DEVICE_FOCUS;
+    uint16_t tzRaw =
+        (uint16_t)EEPROM.read(EE_ADDR_TZ_OFF_LO)
+        | ((uint16_t)EEPROM.read(EE_ADDR_TZ_OFF_HI) << 8);
+    int16_t tz = (int16_t)tzRaw;
+    tzOffsetMinutes = (int16_t)constrain((int)tz, -720, 840);
+    wifiStaConfigured = EEPROM.read(EE_ADDR_WIFI_CONFIGURED) != 0;
+    for (int i = 0; i < EE_WIFI_SSID_MAX; i++)
+      wifiStaSsid[i] = (char)EEPROM.read(EE_ADDR_WIFI_SSID + i);
+    wifiStaSsid[EE_WIFI_SSID_MAX] = '\0';
+    for (int i = 0; i < EE_WIFI_PASS_MAX; i++)
+      wifiStaPass[i] = (char)EEPROM.read(EE_ADDR_WIFI_PASS + i);
+    wifiStaPass[EE_WIFI_PASS_MAX] = '\0';
   }
 
   if (defaultCountdownMinutes < 1 || defaultCountdownMinutes > 120) defaultCountdownMinutes = 20;
@@ -284,7 +538,21 @@ void saveAllSettings() {
   EEPROM.write(EE_ADDR_MILESTONE, milestoneInterval);
   EEPROM.write(EE_ADDR_LAST_MODE, lastMode);
   EEPROM.write(EE_ADDR_LAST_DOWN, lastDownDuration);
-  EEPROM.write(EE_ADDR_LAYOUT, EE_LAYOUT_V3);
+
+  EEPROM.write(EE_ADDR_LAYOUT, EE_LAYOUT_V4);
+  EEPROM.write(EE_ADDR_DEVICE_MODE, deviceMode == DEVICE_CLOCK ? (byte)1 : (byte)0);
+  EEPROM.write(EE_ADDR_TZ_OFF_LO, (byte)((uint16_t)tzOffsetMinutes & 0xFF));
+  EEPROM.write(EE_ADDR_TZ_OFF_HI, (byte)(((uint16_t)tzOffsetMinutes >> 8) & 0xFF));
+  EEPROM.write(EE_ADDR_WIFI_CONFIGURED, wifiStaConfigured ? (byte)1 : (byte)0);
+  for (int i = 0; i < EE_WIFI_SSID_MAX; i++) {
+    EEPROM.write(EE_ADDR_WIFI_SSID + i,
+                   (i < (int)strlen(wifiStaSsid)) ? (byte)wifiStaSsid[i] : (byte)0);
+  }
+  for (int i = 0; i < EE_WIFI_PASS_MAX; i++) {
+    EEPROM.write(EE_ADDR_WIFI_PASS + i,
+                   (i < (int)strlen(wifiStaPass)) ? (byte)wifiStaPass[i] : (byte)0);
+  }
+
   EEPROM.commit();
 } 
 
@@ -318,8 +586,19 @@ void clearPostSessionReminder() {
 
 bool powerLongPressEligible() {
   if (isCounting) return false;
-  if (currentState == POWER_OFF_CONFIRM || currentState == RESET_CONFIRM) return false;
+  if (currentState == POWER_OFF_CONFIRM || currentState == RESET_CONFIRM || currentState == WIFI_PORTAL)
+    return false;
   return true;
+}
+
+void goToPrimaryHomeAfterSession() {
+  menuIndex = 0;
+  if (deviceMode == DEVICE_CLOCK) {
+    currentState = CLOCK_FACE;
+    clockFaceLastTmSec = -1;
+  } else {
+    currentState = MENU;
+  }
 }
 
 void pollEncoderSwitch(unsigned long now) {
@@ -517,6 +796,54 @@ void updateDisplay() {
   display.clearDisplay();
   applyContrastInvert();
 
+  if (currentState == CLOCK_FACE) {
+    time_t t = time(nullptr);
+    if (t < 1000000000) {
+      display.setTextSize(2);
+      String ns = "NO SYNC";
+      display.setCursor(centeredTextX(ns, 2), 22);
+      display.print(ns);
+    } else {
+      struct tm ti;
+      localtime_r(&t, &ti);
+      char hm[8];
+      snprintf(hm, sizeof(hm), "%02d:%02d", ti.tm_hour, ti.tm_min);
+      String sh = String(hm);
+      display.setTextSize(4);
+      display.setCursor(centeredTextX(sh, 4), 10);
+      display.print(sh);
+      display.setTextSize(2);
+      char sc[8];
+      snprintf(sc, sizeof(sc), ":%02d", ti.tm_sec);
+      display.setCursor(centeredTextX(String(sc), 2), 50);
+      display.print(sc);
+    }
+    display.setTextSize(1);
+    String hintCk = "Press: menu";
+    display.setCursor(centeredTextX(hintCk, 1), 56);
+    display.print(hintCk);
+    display.display();
+    return;
+  }
+
+  if (currentState == WIFI_PORTAL) {
+    display.setTextSize(1);
+    display.setCursor(0, 0);
+    display.print(F("WiFi setup"));
+    display.setCursor(0, 10);
+    display.print(F("Join AP:"));
+    display.setCursor(0, 19);
+    display.print(WIFI_AP_SSID);
+    display.setCursor(0, 29);
+    display.print(F("Open in browser:"));
+    display.setCursor(0, 39);
+    display.print(WiFi.softAPIP().toString());
+    display.setCursor(0, 52);
+    display.print(F("Press: cancel"));
+    display.display();
+    return;
+  }
+
   if (currentState == HELP) {
     int helpTopLine = constrain(helpSelectedLine - (helpVisibleLines / 2), 0, max(0, helpLineCount - helpVisibleLines));
     String header = "Help " + String(helpSelectedLine + 1) + "/" + String(helpLineCount);
@@ -544,16 +871,32 @@ void updateDisplay() {
   String hintText;
 
   if (currentState == MENU) {
-    topRowText = "M:" + String(flowMinutes) + " S:" + String(sessionCount);
+    if (deviceMode == DEVICE_CLOCK) {
+      time_t tn = time(nullptr);
+      if (tn > 1000000000) {
+        struct tm tmx;
+        localtime_r(&tn, &tmx);
+        char tb[6];
+        snprintf(tb, sizeof(tb), "%02d:%02d", tmx.tm_hour, tmx.tm_min);
+        topRowText = String(tb);
+      } else {
+        topRowText = "--:--";
+      }
+    } else {
+      topRowText = "M:" + String(flowMinutes) + " S:" + String(sessionCount);
+    }
     hintText = "Rotate / Press";
   } else if (currentState == SETTINGS) {
     const char *titles[] = {
-      "Def", "Idle", "Off", "Anim", "Inv", "Ctrst", "Sess", "Goal", "Pomo", "Brk", "Mile", "Exit"
+      "Def", "Idle", "Off", "Anim", "Inv", "Ctrst", "Sess", "Goal", "Pomo", "Brk", "Mile", "Tz", "WiFi", "Exit"
     };
     topRowText = String(titles[setupPage]) + " " + String(setupPage + 1) + "/" + String((int)SET_PAGE_COUNT);
     hintText = "R:change  P:next";
   } else if (currentState == SOUND_MENU) {
     topRowText = "Sound";
+    hintText = "R:change  P:save";
+  } else if (currentState == MODE_MENU) {
+    topRowText = "Mode";
     hintText = "R:change  P:save";
   } else if (currentState == COUNTING_UP) {
     topRowText = "Focus! \x18";
@@ -630,14 +973,33 @@ void updateDisplay() {
       case SET_PAGE_MILE:
         mainRowText = (milestoneInterval == 0) ? "OFF" : String(milestoneInterval);
         break;
+      case SET_PAGE_TZ: {
+        int mm = tzOffsetMinutes;
+        char sgn = '+';
+        if (mm < 0) {
+          sgn = '-';
+          mm = -mm;
+        }
+        int th = mm / 60;
+        int tm = mm % 60;
+        mainRowText = String(sgn) + String(th / 10) + String(th % 10) + ":" +
+                      String(tm / 10) + String(tm % 10);
+        break;
+      }
+      case SET_PAGE_WIFI:
+        mainRowText = "Portal";
+        break;
       default:
         mainRowText = "?";
         break;
     }
   } else if (currentState == MENU) {
-    mainRowText = menuOptions[menuIndex];
+    mainRowText =
+        (deviceMode == DEVICE_CLOCK) ? String(clockMenuLabels[menuIndex]) : menuOptions[menuIndex];
   } else if (currentState == SOUND_MENU) {
     mainRowText = soundMenuValue ? "ON" : "OFF";
+  } else if (currentState == MODE_MENU) {
+    mainRowText = modeMenuValue ? "CLOCK" : "FOCUS";
   } else if (currentState == COUNTING_UP) {
     mainRowText = formatMinutesSeconds(elapsedSeconds);
   } else if (currentState == RESET_CONFIRM) {
@@ -706,38 +1068,61 @@ void handleButtonPresses(unsigned long currentMillis) {
 
   switch (currentState) {
     case MENU:
-      if (menuIndex == 0) {  // UP selected
-        startCountingUp();
-      } else if (menuIndex == 1) {  // DOWN selected
-        countdownValue = defaultCountdownMinutes;
-        inPomodoroBreak = false;
-        confirmCountdownSelection();
-      } else if (menuIndex == 2) {  // Reset selected
-        currentState = RESET_CONFIRM;
-        resetArmed = true;
-        resetArmedAtMs = millis();
-      } else if (menuIndex == 3) {  // Sound on/off
-        currentState = SOUND_MENU;
-        soundMenuValue = soundEnabled;
-      } else if (menuIndex == 4) {  // Setup
-        currentState = SETTINGS;
-        setupPage = 0;
-        Serial.println("Enter SETTINGS.");
-      } else if (menuIndex == 5) {  // Quick start
-        if (lastMode == 0) {
-          startCountingUp();
-        } else {
-          inPomodoroBreak = false;
-          countdownValue = defaultCountdownMinutes;
-          confirmCountdownSelection();
+      if (deviceMode == DEVICE_CLOCK) {
+        if (menuIndex == 0) {
+          currentState = SETTINGS;
+          setupPage = 0;
+        } else if (menuIndex == 1) {
+          currentState = HELP;
+          helpSelectedLine = 0;
+        } else if (menuIndex == 2) {
+          currentState = MODE_MENU;
+          modeMenuValue = (deviceMode == DEVICE_CLOCK) ? 1 : 0;
         }
-      } else if (menuIndex == 6) {  // Help
-        currentState = HELP;
-        helpSelectedLine = 0;
+      } else {
+        if (menuIndex == 0) {
+          startCountingUp();
+        } else if (menuIndex == 1) {
+          countdownValue = defaultCountdownMinutes;
+          inPomodoroBreak = false;
+          confirmCountdownSelection();
+        } else if (menuIndex == 2) {
+          currentState = RESET_CONFIRM;
+          resetArmed = true;
+          resetArmedAtMs = millis();
+        } else if (menuIndex == 3) {
+          currentState = SOUND_MENU;
+          soundMenuValue = soundEnabled;
+        } else if (menuIndex == 4) {
+          currentState = SETTINGS;
+          setupPage = 0;
+          Serial.println("Enter SETTINGS.");
+        } else if (menuIndex == 5) {
+          if (lastMode == 0) {
+            startCountingUp();
+          } else {
+            inPomodoroBreak = false;
+            countdownValue = defaultCountdownMinutes;
+            confirmCountdownSelection();
+          }
+        } else if (menuIndex == 6) {
+          currentState = HELP;
+          helpSelectedLine = 0;
+        } else if (menuIndex == 7) {
+          currentState = MODE_MENU;
+          modeMenuValue = (deviceMode == DEVICE_CLOCK) ? 1 : 0;
+        }
       }
       break;
 
     case SETTINGS:
+      if (setupPage == SET_PAGE_WIFI) {
+        wifiPortalReturnSettings = true;
+        startWifiPortal();
+        currentState = WIFI_PORTAL;
+        Serial.println("WiFi portal started.");
+        break;
+      }
       if (setupPage == SET_PAGE_EXIT) {
         currentState = MENU;
         setupPage = 0;
@@ -746,9 +1131,35 @@ void handleButtonPresses(unsigned long currentMillis) {
         saveAllSettings();
         recomputeTimeLimits();
         applyContrastInvert();
+        if (WiFi.status() == WL_CONNECTED) applyNtpFromSettings();
         setupPage++;
         Serial.print("SETTINGS page "); Serial.println(setupPage);
       }
+      break;
+
+    case MODE_MENU:
+      deviceMode = modeMenuValue ? DEVICE_CLOCK : DEVICE_FOCUS;
+      saveAllSettings();
+      if (deviceMode == DEVICE_CLOCK) {
+        currentState = CLOCK_FACE;
+        clockFaceLastTmSec = -1;
+      } else {
+        currentState = MENU;
+        menuIndex = 0;
+      }
+      Serial.print("Device mode "); Serial.println(deviceMode == DEVICE_CLOCK ? "CLOCK" : "FOCUS");
+      break;
+
+    case WIFI_PORTAL:
+      stopWifiPortalCore();
+      resumeStaIfConfigured();
+      if (wifiPortalReturnSettings) {
+        wifiPortalReturnSettings = false;
+        currentState = SETTINGS;
+      } else {
+        currentState = MENU;
+      }
+      Serial.println("WiFi portal cancelled.");
       break;
 
     case SOUND_MENU:
@@ -793,6 +1204,11 @@ void handleButtonPresses(unsigned long currentMillis) {
 
     case HELP:
       currentState = MENU;
+      break;
+
+    case CLOCK_FACE:
+      currentState = MENU;
+      menuIndex = 0;
       break;
 
     default:
@@ -864,7 +1280,7 @@ void stopCountingUp() {
   bumpSessionCount();
   checkGoalCelebration(previousFlow);
   successAnimation();
-  currentState = MENU;
+  goToPrimaryHomeAfterSession();
   isCounting = false;
   inPomodoroBreak = false;
   lastActivityTime = millis();
@@ -883,7 +1299,7 @@ void stopCountingDown() {
     checkGoalCelebration(previousFlow);
   }
   successAnimation();
-  currentState = MENU;
+  goToPrimaryHomeAfterSession();
   isCounting = false;
   inPomodoroBreak = false;
   lastActivityTime = millis();
@@ -939,7 +1355,7 @@ void handleCounting(unsigned long currentMillis) {
       if (inPomodoroBreak) {
         inPomodoroBreak = false;
         successAnimation();
-        currentState = MENU;
+        goToPrimaryHomeAfterSession();
         isCounting = false;
         lastActivityTime = currentMillis;
         armPostSessionReminder();
@@ -962,7 +1378,7 @@ void handleCounting(unsigned long currentMillis) {
           playSessionStartTone();
           Serial.println("Pomodoro break started.");
         } else {
-          currentState = MENU;
+          goToPrimaryHomeAfterSession();
           isCounting = false;
           lastActivityTime = currentMillis;
           armPostSessionReminder();
@@ -1062,7 +1478,7 @@ int getRotation() {
 //=========================================================
 // Handle rotary input for menu and countdown selection
 void handleRotaryInput() {
-  if (currentState == IDLE) return;
+  if (currentState == IDLE || currentState == CLOCK_FACE || currentState == WIFI_PORTAL) return;
   if (digitalRead(SW) == LOW) return;  // Do not rotate while button is held
   if (millis() - lastSwitchLowMs < switchLowRotaryBlockMs) return;  // Block around press edges/bounce
   if (millis() < rotaryIgnoreUntilMs) return;  // Ignore post-click jitter window
@@ -1078,10 +1494,11 @@ void handleRotaryInput() {
 
   if (currentState == MENU) {
     if (resetArmed) resetArmed = false;
-    menuIndex = (menuIndex + rotation + menuOptionCount) % menuOptionCount;
+    int mc = (deviceMode == DEVICE_CLOCK) ? clockMenuCount : menuOptionCount;
+    menuIndex = (menuIndex + rotation + mc * 256) % mc;
     updateDisplay();
     Serial.print(millis());  // Print the current time in milliseconds
-    Serial.print(" - Menu option: "); Serial.println(menuOptions[menuIndex]);
+    Serial.print(" - Menu option idx "); Serial.println(menuIndex);
   } else if (currentState == SELECTING_DOWN_DURATION) {
     lastSelectValueBeforeRotate = countdownValue;
     lastSelectRotateMs = millis();
@@ -1131,9 +1548,18 @@ void handleRotaryInput() {
       case SET_PAGE_MILE:
         milestoneInterval = (uint8_t)constrain((int)milestoneInterval + rotation, 0, 30);
         break;
+      case SET_PAGE_TZ:
+        tzOffsetMinutes =
+            (int16_t)constrain((int)tzOffsetMinutes + rotation * 15, -720, 840);
+        break;
+      case SET_PAGE_WIFI:
+        break;
       default:
         break;
     }
+    updateDisplay();
+  } else if (currentState == MODE_MENU) {
+    if (rotation != 0) modeMenuValue ^= 1;
     updateDisplay();
   } else if (currentState == SOUND_MENU) {
     if (rotation != 0) {
@@ -1171,8 +1597,8 @@ void handleInactivity(unsigned long currentMillis) {
   Serial.println(lastActivityTime);
   */
 
-  // Post-session IDLE reminder: only after a finished session (incl. break), Menu idle preset elapsed without starting new session.
-  if (postSessionReminderPending && currentState == MENU &&
+  // Post-session IDLE reminder: only in Focus mode after a finished session (incl. break), Menu idle preset elapsed without starting new session.
+  if (deviceMode == DEVICE_FOCUS && postSessionReminderPending && currentState == MENU &&
       currentMillis >= sessionEndedAtMs &&
       (currentMillis - sessionEndedAtMs >= inactivityLimitMs)) {
     currentState = IDLE;
